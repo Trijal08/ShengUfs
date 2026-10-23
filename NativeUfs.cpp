@@ -734,6 +734,15 @@ static void hostWrite (unsigned offset, uint32_t value)
 // Bring the live controller up for reading: map, SMMU pass-through for the UFS stream, take over
 // the request list, wake the device from UFS-PowerDown and wait for LUN 0 to be ready.
 // `why` receives a short reason on failure.
+// A pause that needs no timer interrupt: hostBringUp can run from the root-device match, before
+// the CPU driver has started the timer, where a timed sleep would never return.
+static void hostPause (unsigned milliseconds)
+{
+  uint64_t deadline;
+  clock_interval_to_deadline (milliseconds, kMillisecondScale, &deadline);
+  while (mach_absolute_time () < deadline) IODelay (50);
+}
+
 static bool hostBringUp (const char **why)
 {
   if (gHost.poisoned) {
@@ -820,7 +829,7 @@ static bool hostBringUp (const char **why)
       *why = "wake (START STOP UNIT)";
       return false;
     }
-    IOSleep (50);
+    hostPause (50);
   }
   gRootDiagnostic.stage = "LUN ready";
   for (unsigned attempt = 0; attempt < 20; attempt++) {
@@ -831,7 +840,7 @@ static bool hostBringUp (const char **why)
       return true;
     }
     if (gHost.poisoned) break;
-    IOSleep (10);
+    hostPause (10);
   }
   gHost.ready = false;
   *why = "LUN 0 not ready";
@@ -1591,6 +1600,7 @@ bool NativeUfs::start (IOService *provider)
   PE_parse_boot_argn ("native-ufs-probe", &probe, sizeof (probe));
   PE_parse_boot_argn ("native-ufs-root", &rootMode, sizeof (rootMode));
   native_ufs_probe_requested = probe != 0;
+  IOLog ("NativeUfs: start on %s: native-ufs-probe=%u native-ufs-root=%u\n", provider ? provider->getName () : "?", probe, rootMode);
   // Default: match for observability only, never touch the controller. Hardware work runs once,
   // from the root-device personality; the ufshc nub match stays observation-only.
   if ((!probe && !rootMode) || !OSDynamicCast (IOPlatformExpertDevice, provider)) {
@@ -1622,6 +1632,28 @@ bool NativeUfs::start (IOService *provider)
   }
   if ((probe >= 3 && probe <= 5) || probe == 9) {
     adoptAndRead (probe);
+  }
+  if (probe == 16) {
+    // The root check of probe 10 reported through the console instead of a panic, for boards whose
+    // panic path is not yet proven. Soft-fails: the boot continues without a root.
+    const char *why = "";
+    gRootDiagnosticEnabled = true;
+    RootLayout *layout = static_cast<RootLayout *> (IOMalloc (sizeof (RootLayout)));
+    bool up = hostBringUp (&why);
+    bool found = up && layout && findRootLayout (layout, &why);
+    gRootDiagnostic.published = native_ufs_blocks_published;
+    formatUfsRootDiagnostics (gRootDiagnosticText, sizeof (gRootDiagnosticText), gRootDiagnostic,
+                              found ? "root check passed" : why, "NATIVE_UFS ROOT CHECK");
+    IOLog ("%s", gRootDiagnosticText);
+    if (found) {
+      IOLog ("NativeUfs: %s first=%llx last=%llx block0 magic %08x %08x ext4magic=%04x manifest status=%u windows=%u\n",
+             kUfsRootPartition, layout->userdataFirst, layout->userdataLast, layout->magic0, layout->magic1,
+             layout->ext4Magic, layout->manifestStatus, layout->windows);
+    } else {
+      IOLog ("NativeUfs: root check failed: %s (bring-up %s)\n", why, up ? "ok" : "failed");
+    }
+    if (layout) IOFree (layout, sizeof (RootLayout));
+    return false;
   }
   if (probe == 10) {
     // Read-only check before anything is flashed: LUN 0 GPT -> "userdata" -> its first block.
