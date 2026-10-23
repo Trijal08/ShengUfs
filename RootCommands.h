@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Shared production command path. Included inside the root transport namespace.
 // The host harness replaces only MMIO, DMA synchronization, clock and lock primitives.
+// PRDT entries per command: the data area split at the SoC's transfer granularity (QcomUfsHost.h /
+// ExynosUfsHost.h kUfsPrdEntryMax). They occupy [kPrdtOffset, kPrdtOffset + 16 * kUfsPrdtEntries) of the UCD.
+static constexpr uint32_t kUfsPrdtEntries = (kDataMax + kUfsPrdEntryMax - 1) / kUfsPrdEntryMax;
+static_assert (kPrdtOffset + 16 * kUfsPrdtEntries <= 4096, "PRDT must stay inside the command descriptor page");
 struct HardwareTransferPort {
   uint64_t deadline;
   uint32_t doorbell () { return read32 (gHost.hc, 0x58); }
@@ -66,19 +70,23 @@ static IOReturn hostSubmit (uint32_t direction, uint32_t dataBytes, uint32_t tim
   words[4] = static_cast<uint32_t> (ucdPhys);
   words[5] = static_cast<uint32_t> (ucdPhys >> 32);
   words[6] = (512U >> 2) | ((kRspOffset >> 2) << 16);
-  words[7] = (dataBytes ? 1U : 0U) | ((kPrdtOffset >> 2) << 16);
-  if (dataBytes) {
-    uint64_t dataPhys = gHost.phys + kDataOffset;
-    uint32_t *prd = reinterpret_cast<uint32_t *> (gHost.virt + kUcdOffset + kPrdtOffset);
+  uint32_t entries = dataBytes ? (dataBytes + kUfsPrdEntryMax - 1) / kUfsPrdEntryMax : 0U;
+  words[7] = entries | ((kPrdtOffset >> 2) << 16);
+  for (uint32_t entry = 0, done = 0; entry < entries; entry++) {
+    uint32_t chunk = dataBytes - done > kUfsPrdEntryMax ? kUfsPrdEntryMax : dataBytes - done;
+    uint64_t dataPhys = gHost.phys + kDataOffset + done;
+    uint32_t *prd = reinterpret_cast<uint32_t *> (gHost.virt + kUcdOffset + kPrdtOffset + 16 * entry);
     prd[0] = static_cast<uint32_t> (dataPhys);
     prd[1] = static_cast<uint32_t> (dataPhys >> 32);
     prd[2] = 0;
-    prd[3] = dataBytes - 1;
+    prd[3] = chunk - 1;
+    done += chunk;
   }
   cacheCivac (gHost.virt, kDataOffset + dataBytes);
   hostWrite (0x20, 1);  // Acknowledge completion only; preserve error evidence.
   HardwareTransferPort port;
   clock_interval_to_deadline (timeoutUs, kMicrosecondScale, &port.deadline);
+  hostPlatformBeforeSubmit (gHost.virt[kUcdOffset] == 0x01);   // SCSI COMMAND UPIU, or NOP OUT / QUERY
   hostWrite (0x58, 1);
   UfsTransferPoll state;
   UfsTransferEnd end = pollUfsTransfer (port, state);
@@ -115,7 +123,7 @@ static bool hostClearUcd (void)
     return false;
   }
   uint32_t *words = reinterpret_cast<uint32_t *> (gHost.virt + kUcdOffset);
-  for (unsigned index = 0; index < (kPrdtOffset + 16) / 4; index++) {
+  for (unsigned index = 0; index < (kPrdtOffset + 16 * kUfsPrdtEntries) / 4; index++) {
     words[index] = 0;
   }
   return true;

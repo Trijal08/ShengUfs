@@ -103,7 +103,9 @@ static bool findRootLayout (RootLayout *layout, const char **why)
     *why = "GPT entries CRC";
     return false;
   }
-  static const char wanted[] = "userdata";
+  // The partition that carries the root image: the board's choice (QcomUfsHost.h / ExynosUfsHost.h).
+  const char *const wanted = kUfsRootPartition;
+  const unsigned wantedLength = static_cast<unsigned> (strlen (wanted)) + 1;   // compared with its terminator
   bool found = false;
   for (uint32_t index = 0; index < count; index++) {
     const uint8_t *entry = gScratch + index * 128;
@@ -121,7 +123,7 @@ static bool findRootLayout (RootLayout *layout, const char **why)
       }
     }
     bool match = true;
-    for (unsigned c = 0; c < sizeof (wanted); c++) {
+    for (unsigned c = 0; c < wantedLength; c++) {
       if (entry[56 + 2 * c] != static_cast<uint8_t> (wanted[c]) || entry[57 + 2 * c] != 0) {
         match = false;
         break;
@@ -129,7 +131,7 @@ static bool findRootLayout (RootLayout *layout, const char **why)
     }
     if (match) {
       if (found) {
-        *why = "duplicate userdata partition";
+        *why = "duplicate root partition";
         return false;
       }
       layout->userdataFirst = le64 (entry + 32);
@@ -138,7 +140,7 @@ static bool findRootLayout (RootLayout *layout, const char **why)
     }
   }
   if (!found || layout->userdataLast < layout->userdataFirst) {
-    *why = "no userdata partition";
+    *why = "no root partition";
     return false;
   }
   gRootDiagnostic.first = layout->userdataFirst;

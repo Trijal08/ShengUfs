@@ -29,10 +29,8 @@ extern const uint8_t verified_root_key[];
 #include <libkern/libkern.h>
 #include <pexpert/pexpert.h>
 #include <kern/debug.h>
-#include "GccUfs.h"
 #include "RootDiagnostics.h"
 #include "TransferPoll.h"
-#include "SmmuTakeover.h"
 
 static UfsRootDiagnostics gRootDiagnostic;
 static bool gRootDiagnosticEnabled;
@@ -106,6 +104,30 @@ static bool contains (const char *data, size_t length, const char *needle)
   return false;
 }
 
+// Read-only inspection (native-ufs-probe=2): reports what firmware left behind.
+// The physical windows are the sheng board DT's own GCC (0x100000) and UFS host
+// (0x1d84000, 0x3000) ranges. The controller is read only if the GCC says its
+// GDSC is powered and the AXI/AHB branches are running; nothing is written.
+static uintptr_t mapPhys (uint64_t phys, uint64_t length, OSSharedPtr<IOMemoryMap> &keep)
+{
+  IODeviceMemory *memory = IODeviceMemory::withRange (phys, length);
+  if (!memory) {
+    return 0;
+  }
+  keep = OSSharedPtr<IOMemoryMap> (memory->map (kIOMapAnywhere | kIOMapInhibitCache), OSNoRetain);
+  memory->release ();
+  return keep ? static_cast<uintptr_t> (keep->getVirtualAddress ()) : 0;
+}
+
+// The host glue: everything that is a property of the SoC rather than of UFS. QcomUfsHost.h is the
+// SM8550 path NativeUfs was written on; ExynosUfsHost.h the Google Tensor (zuma/zumapro) path. Each
+// supplies the same names (listed in QcomUfsHost.h); NATIVE_UFS_HOST_EXYNOS selects.
+#if defined(NATIVE_UFS_HOST_EXYNOS) && NATIVE_UFS_HOST_EXYNOS
+#include "ExynosUfsHost.h"
+#else
+#include "QcomUfsHost.h"
+#endif
+
 IOService *NativeUfs::probe (IOService *provider, SInt32 *score)
 {
   native_ufs_probe_calls = native_ufs_probe_calls + 1;
@@ -125,10 +147,10 @@ IOService *NativeUfs::probe (IOService *provider, SInt32 *score)
   bool match = false;
   if (data) {
     const char *text = static_cast<const char *> (data->getBytesNoCopy ());
-    match = text && contains (text, data->getLength (), "qcom,sm8550-ufshc");
+    match = text && contains (text, data->getLength (), kUfsHostCompatible);
   } else if (string) {
     const char *text = string->getCStringNoCopy ();
-    match = text && contains (text, string->getLength (), "qcom,sm8550-ufshc");
+    match = text && contains (text, string->getLength (), kUfsHostCompatible);
   }
   if (!match) {
     return nullptr;
@@ -151,63 +173,10 @@ bool NativeUfs::waitSet (uintptr_t base, unsigned offset, uint32_t mask, unsigne
   return false;
 }
 
-// Read-only inspection (native-ufs-probe=2): reports what firmware left behind.
-// The physical windows are the sheng board DT's own GCC (0x100000) and UFS host
-// (0x1d84000, 0x3000) ranges. The controller is read only if the GCC says its
-// GDSC is powered and the AXI/AHB branches are running; nothing is written.
-static uintptr_t mapPhys (uint64_t phys, uint64_t length, OSSharedPtr<IOMemoryMap> &keep)
-{
-  IODeviceMemory *memory = IODeviceMemory::withRange (phys, length);
-  if (!memory) {
-    return 0;
-  }
-  keep = OSSharedPtr<IOMemoryMap> (memory->map (kIOMapAnywhere | kIOMapInhibitCache), OSNoRetain);
-  memory->release ();
-  return keep ? static_cast<uintptr_t> (keep->getVirtualAddress ()) : 0;
-}
 
 void NativeUfs::inspect (void)
 {
-  OSSharedPtr<IOMemoryMap> gccMap, memPhyMap, hcMap;
-  uintptr_t gcc = mapPhys (GCC_BASE + 0x77000, 0x1000, gccMap);
-  uintptr_t memPhy = mapPhys (GCC_BASE + 0x9e000, 0x1000, memPhyMap);
-  if (!gcc || !memPhy) {
-    panic ("NATIVE_UFS inspect: GCC map failed gcc=%p memphy=%p", (void *) gcc, (void *) memPhy);
-  }
-  uint32_t gdsc = read32 (gcc, GCC_UFS_PHY_GDSCR - 0x77000);
-  uint32_t axi = read32 (gcc, GCC_UFS_PHY_AXI_ENABLE - 0x77000);
-  uint32_t ahb = read32 (gcc, GCC_UFS_PHY_AHB_ENABLE - 0x77000);
-  uint32_t unipro = read32 (gcc, GCC_UFS_PHY_UNIPRO_CORE_ENABLE - 0x77000);
-  uint32_t txs = read32 (gcc, GCC_UFS_PHY_TX_SYMBOL0_ENABLE - 0x77000);
-  uint32_t rxs = read32 (gcc, GCC_UFS_PHY_RX_SYMBOL0_ENABLE - 0x77000);
-  uint32_t aux = read32 (gcc, GCC_UFS_PHY_PHY_AUX_ENABLE - 0x77000);
-  uint32_t memGdsc = read32 (memPhy, 0);
-  // GDSCR bit31 PWR_ON; CBCR bit31 CLK_OFF.
-  bool powered = (gdsc & 0x80000000U) != 0;
-  // Hardware 2026-10-17: AXI running, AHB enabled but CLK_OFF (bit31). With bit1 (HW gating)
-  // set the branch wakes on access, so enable bits, not CLK_OFF, gate the read-only probe.
-  bool busClocks = !(axi & 0x80000000U) && (ahb & 0x1U) && (axi & 0x1U);
-  uint32_t cap = 0, ver = 0, hcs = 0, hce = 0, utrlba = 0, is = 0;
-  unsigned readHc = 0;
-  if (powered && busClocks) {
-    uintptr_t hc = mapPhys (UFS_HC_BASE, UFS_HC_SIZE, hcMap);
-    if (hc) {
-      cap = read32 (hc, 0x00);
-      ver = read32 (hc, 0x08);
-      is = read32 (hc, 0x20);
-      hcs = read32 (hc, 0x30);
-      hce = read32 (hc, 0x34);
-      utrlba = read32 (hc, 0x50);
-      readHc = 1;
-    }
-  }
-  panic ("NATIVE_UFS inspect\n"
-         "gdsc=%08x memphygdsc=%08x\n"
-         "axi=%08x ahb=%08x unipro=%08x\n"
-         "txsym=%08x rxsym=%08x aux=%08x\n"
-         "hc_read=%u cap=%08x ver=%08x\n"
-         "is=%08x hcs=%08x hce=%08x utrlba=%08x",
-         gdsc, memGdsc, axi, ahb, unipro, txs, rxs, aux, readHc, cap, ver, is, hcs, hce, utrlba);
+  hostPlatformInspect ();
 }
 
 // Adopt the controller the firmware left running (native-ufs-probe=3) and issue
@@ -267,60 +236,6 @@ static void zero32 (void *start, size_t length)
 }
 
 
-// Give the UFS stream a pass-through mapping the way Linux does on this firmware.
-// Hardware 2026-10-17: after hand-off apps_smmu has sCR0 = 0x002f0406 (USFCFG=1, unmatched
-// streams fault), no stream-match entry for the UFS host (ID 0x60, `iommus = <&apps_smmu 0x60
-// 0x0>` in the board DT), a TYPE=BYPASS S2CR reads back as FAULT, and sCR0 writes are ignored.
-// Linux (drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c, qcom_smmu_cfg_probe + qcom_smmu_write_s2cr,
-// "bypass_quirk") meets exactly this: it reserves the LAST context bank (num_context_banks-1),
-// writes SCTLR=0 (stage 1 disabled) and CBAR.TYPE=S1_TRANS_S2_BYPASS there, and maps a bypass
-// stream as S2CR TYPE=TRANSLATE with CBNDX = that bank. S2CR is written before SMR
-// (arm_smmu_write_sme). ARM IHI 0062D.c table 3-1 additionally requires VA64=1
-// for inputs above 32 bits even with SCTLR.M=0. Storage DMA path only; this
-// is physical pass-through, not a page-table or Adreno 4 KiB qualification.
-static void smmuBypassStream (uint16_t stream, OSSharedPtr<IOMemoryMap> &keep, uint32_t *report,
-                              uint64_t dma, uint64_t bytes)
-{
-  uintptr_t smmu = mapPhys (0x15000000ULL, 0xd0000, keep);
-  if (!smmu) {
-    panic ("NATIVE_UFS smmu: map failed");
-  }
-  UfsSmmuPlan plan = planUfsSmmu (stream, dma, bytes, [smmu](unsigned offset) { return read32 (smmu, offset); });
-  gRootDiagnostic.smmuId1 = read32 (smmu, 0x24);
-  gRootDiagnostic.smmuId2 = read32 (smmu, 0x28);
-  gRootDiagnostic.smmuSlot = plan.slot;
-  if (plan.error) {
-    gRootDiagnostic.stage = "SMMU planning";
-    gRootDiagnostic.result = static_cast<uint32_t> (kIOReturnNotReady);
-    gRootDiagnostic.smr = plan.smr; gRootDiagnostic.s2cr = plan.s2cr;
-    rootDiagnosticFailure (plan.error);
-    panic ("NATIVE_UFS smmu: %s slot=%u smr=%x s2cr=%x", plan.error, plan.slot, plan.smr, plan.s2cr);
-  }
-  unsigned bank = plan.bank, index = plan.slot;
-  uintptr_t cb = smmu + (plan.pages + bank) * 4096;
-  const char *failure = configureUfsSmmu (plan, stream,
-    [smmu](unsigned offset) { return read32 (smmu, offset); },
-    [smmu](unsigned offset, uint32_t value) {
-      write32 (smmu, offset, value);
-      __asm__ volatile ("dsb sy" ::: "memory");
-    });
-  uint32_t smr = read32 (smmu, 0x800 + 4 * index), s2cr = read32 (smmu, 0xc00 + 4 * index);
-  uint32_t cbar = read32 (smmu, 0x1000 + 4 * bank), sctlr = read32 (cb, 0x0);
-  gRootDiagnostic.smr = smr; gRootDiagnostic.s2cr = s2cr;
-  gRootDiagnostic.cbar = cbar; gRootDiagnostic.sctlr = sctlr;
-  gRootDiagnostic.smmuId2 = read32 (smmu, 0x28);
-  gRootDiagnostic.cba2r = read32 (smmu, 0x1800 + 4 * bank);
-  if (failure) {
-    gRootDiagnostic.stage = "SMMU readback";
-    gRootDiagnostic.result = static_cast<uint32_t> (kIOReturnNotReady);
-    rootDiagnosticFailure (failure);
-    panic ("NATIVE_UFS smmu: %s idx=%u bank=%u cba2r=%x", failure, index, bank,
-           gRootDiagnostic.cba2r);
-  }
-  report[0] = index | (bank << 16);
-  report[1] = cbar;
-  report[2] = sctlr;
-}
 
 void NativeUfs::adoptAndRead (unsigned level)
 {
@@ -367,7 +282,7 @@ void NativeUfs::adoptAndRead (unsigned level)
   unsigned stopLoops = 10000;
   while ((read32 (hc, 0x60) & 1) && stopLoops--) IODelay (10);
   if (read32 (hc, 0x60) & 1) panic ("NATIVE_UFS adopt: request list did not stop");
-  smmuBypassStream (0x60, smmuMap, smmuReport, phys, 16384);
+  hostPlatformPrepareDma (smmuMap, smmuReport, phys, 16384);
   write32 (hc, 0x50, static_cast<uint32_t> (phys));
   write32 (hc, 0x54, static_cast<uint32_t> (phys >> 32));
   write32 (hc, 0x20, 0xffffffffU);  // clear stale status
@@ -387,7 +302,7 @@ void NativeUfs::adoptAndRead (unsigned level)
     uint8_t *utrd = virt;
     uint8_t *ucd = virt + ucdOffset;
     zero32 (utrd, 32);
-    zero32 (ucd, 1024 + 16);
+    zero32 (ucd, 1024 + 16 * ((8192 + kUfsPrdEntryMax - 1) / kUfsPrdEntryMax));
     zero32 (virt + dataOffset, 8192);
     ucd[0] = 0x01;                  // COMMAND UPIU
     ucd[1] = toHost ? 0x40 : 0x00;  // flags: read
@@ -404,17 +319,23 @@ void NativeUfs::adoptAndRead (unsigned level)
     *reinterpret_cast<uint32_t *> (utrd + 16) = static_cast<uint32_t> (ucdPhys);
     *reinterpret_cast<uint32_t *> (utrd + 20) = static_cast<uint32_t> (ucdPhys >> 32);
     *reinterpret_cast<uint32_t *> (utrd + 24) = (512U >> 2) | ((rspOffset >> 2) << 16);   // response length | offset (dwords)
-    uint32_t prdEntries = length ? 1U : 0U;
+    // One PRDT entry per kUfsPrdEntryMax bytes: the SoC's transfer granularity (the whole buffer on
+    // SM8550, the 4096-byte data unit on Exynos).
+    uint32_t prdEntries = length ? (length + kUfsPrdEntryMax - 1) / kUfsPrdEntryMax : 0U;
     *reinterpret_cast<uint32_t *> (utrd + 28) = prdEntries | ((prdtOffset >> 2) << 16);
-    if (length) {
-      uint64_t dataPhys = phys + dataOffset;
-      uint8_t *prd = ucd + prdtOffset;
+    for (uint32_t entry = 0, done = 0; entry < prdEntries; entry++) {
+      uint32_t chunk = length - done > kUfsPrdEntryMax ? kUfsPrdEntryMax : length - done;
+      uint64_t dataPhys = phys + dataOffset + done;
+      uint8_t *prd = ucd + prdtOffset + 16 * entry;
       *reinterpret_cast<uint32_t *> (prd + 0) = static_cast<uint32_t> (dataPhys);
       *reinterpret_cast<uint32_t *> (prd + 4) = static_cast<uint32_t> (dataPhys >> 32);
-      *reinterpret_cast<uint32_t *> (prd + 12) = length - 1;
+      *reinterpret_cast<uint32_t *> (prd + 8) = 0;
+      *reinterpret_cast<uint32_t *> (prd + 12) = chunk - 1;
+      done += chunk;
     }
     cacheClean (virt, 16384);
     write32 (hc, 0x20, 0xffffffffU);
+    hostPlatformBeforeSubmit (true);  // every command built here is a SCSI COMMAND UPIU
     write32 (hc, 0x58, 1);          // ring slot 0
     UfsResult result = { 0xf, 0xff, 0xff, 0, 0, 0 };
     bool done = false;
@@ -448,7 +369,7 @@ void NativeUfs::adoptAndRead (unsigned level)
     uint8_t *utrd = virt;
     uint8_t *ucd = virt + ucdOffset;
     zero32 (utrd, 32);
-    zero32 (ucd, 1024 + 16);
+    zero32 (ucd, 1024 + 16 * ((8192 + kUfsPrdEntryMax - 1) / kUfsPrdEntryMax));
     if (kind == 0) {
       ucd[0] = 0x00;                // NOP OUT
     } else {
@@ -467,6 +388,7 @@ void NativeUfs::adoptAndRead (unsigned level)
     *reinterpret_cast<uint32_t *> (utrd + 28) = (prdtOffset >> 2) << 16;
     cacheClean (virt, 16384);
     write32 (hc, 0x20, 0xffffffffU);
+    hostPlatformBeforeSubmit (false); // NOP OUT or QUERY REQUEST
     write32 (hc, 0x58, 1);
     bool done = false;
     for (unsigned loops = 0; loops < 100000; loops++) {
@@ -710,86 +632,14 @@ void NativeUfs::dumpFirmwareList (void)
          ucdPhys, ucd0, ucd1, ucd2, ucd3);
 }
 
-// Read-only dump of the apps SMMU (apps_smmu@15000000) global register space and the stream
-// match entry for the UFS stream ID 0x60 (native-ufs-probe=7). SMMUv2 layout: sCR0 0x0,
-// IDR0 0x20, sGFSR 0x48, SMR(n) 0x800+4n, S2CR(n) 0xc00+4n. Nothing is written.
 void NativeUfs::inspectSmmu (void)
 {
-  OSSharedPtr<IOMemoryMap> map;
-  uintptr_t smmu = mapPhys (0x15000000ULL, 0x1000, map);
-  if (!smmu) {
-    panic ("NATIVE_UFS smmu: map failed");
-  }
-  uint32_t scr0 = read32 (smmu, 0x00), idr0 = read32 (smmu, 0x20), idr1 = read32 (smmu, 0x24);
-  uint32_t gfsr = read32 (smmu, 0x48);
-  unsigned count = idr0 & 0xff;
-  if (count > 128) {
-    count = 128;
-  }
-  unsigned match = 0xffff, valid = 0, typeCount[4] = { 0, 0, 0, 0 };
-  uint32_t matchSmr = 0, matchS2cr = 0;
-  for (unsigned index = 0; index < count; index++) {
-    uint32_t smr = read32 (smmu, 0x800 + 4 * index);
-    uint32_t s2cr = read32 (smmu, 0xc00 + 4 * index);
-    if (smr & 0x80000000U) {
-      valid++;
-      typeCount[(s2cr >> 16) & 3]++;
-      uint32_t mask = (smr >> 16) & 0x7fff;
-      if (match == 0xffff && (((smr ^ 0x60U) & 0x7fffU) & ~mask) == 0) {
-        match = index;
-        matchSmr = smr;
-        matchS2cr = s2cr;
-      }
-    }
-  }
-  panic ("NATIVE_UFS smmu\n"
-         "scr0=%08x idr0=%08x idr1=%08x gfsr=%08x\n"
-         "nsmr=%u valid=%u types t0=%u t1=%u t2=%u\n"
-         "sid0x60 match=%x smr=%08x s2cr=%08x",
-         scr0, idr0, idr1, gfsr, count, valid, typeCount[0], typeCount[1], typeCount[2],
-         match, matchSmr, matchS2cr);
+  hostPlatformInspectSmmu ();
 }
 
-// Read-only context-bank survey (native-ufs-probe=8): CBAR/CBA2R in gr1 and SCTLR/TTBR0 in the
-// context banks, to find a bank the hypervisor leaves to us. Nothing is written.
 void NativeUfs::inspectContextBanks (void)
 {
-  OSSharedPtr<IOMemoryMap> map;
-  uintptr_t smmu = mapPhys (0x15000000ULL, 0xd0000, map);
-  if (!smmu) {
-    panic ("NATIVE_UFS cb: map failed");
-  }
-  uint32_t idr1 = read32 (smmu, 0x24);
-  unsigned numCb = idr1 & 0xff;
-  unsigned globalPages = 1U << (((idr1 >> 28) & 7) + 1);
-  if (globalPages > 128 || numCb > 128 || (globalPages + numCb) * 0x1000 > 0xd0000) {
-    panic ("NATIVE_UFS cb: unexpected geometry idr1=%08x", idr1);
-  }
-  unsigned cbarZero = 0, sctlrZero = 0, mSet = 0, bothZero = 0;
-  uint32_t firstZero = 0xffff;
-  for (unsigned index = 0; index < numCb; index++) {
-    uint32_t cbar = read32 (smmu, 0x1000 + 4 * index);
-    uint32_t sctlr = read32 (smmu + (globalPages + index) * 0x1000, 0x0);
-    cbarZero += cbar == 0;
-    sctlrZero += sctlr == 0;
-    mSet += (sctlr & 1) != 0;
-    if (cbar == 0 && sctlr == 0) {
-      bothZero++;
-      if (firstZero == 0xffff) {
-        firstZero = index;
-      }
-    }
-  }
-  uintptr_t cb0 = smmu + globalPages * 0x1000, cb1 = cb0 + 0x1000, cbLast = cb0 + (numCb - 1) * 0x1000;
-  panic ("NATIVE_UFS cb survey\n"
-         "ncb=%u pages=%u cbar0=%u sctlr0=%u msset=%u both0=%u first0=%x\n"
-         "cbar[0]=%08x cbar[1]=%08x cbar[%u]=%08x\n"
-         "sctlr[0]=%08x sctlr[1]=%08x sctlr[last]=%08x\n"
-         "cba2r[0]=%08x cba2r[1]=%08x",
-         numCb, globalPages, cbarZero, sctlrZero, mSet, bothZero, firstZero,
-         read32 (smmu, 0x1000), read32 (smmu, 0x1004), numCb - 1, read32 (smmu, 0x1000 + 4 * (numCb - 1)),
-         read32 (cb0, 0), read32 (cb1, 0), read32 (cbLast, 0),
-         read32 (smmu, 0x1800), read32 (smmu, 0x1804));
+  hostPlatformInspectContextBanks ();
 }
 
 // ======================================================================================
@@ -877,6 +727,9 @@ static void hostWrite (unsigned offset, uint32_t value)
 #include "RootQueue.h"
 
 #include "RootCommands.h"
+#if defined(NATIVE_UFS_HOST_EXYNOS) && NATIVE_UFS_HOST_EXYNOS
+#include "ExynosUfsPower.h"   // device init and gear change after a re-trained link
+#endif
 
 // Bring the live controller up for reading: map, SMMU pass-through for the UFS stream, take over
 // the request list, wake the device from UFS-PowerDown and wait for LUN 0 to be ready.
@@ -927,11 +780,9 @@ static bool hostBringUp (const char **why)
   uint32_t report[3] = { 0, 0, 0 };
   gRootDiagnostic.stage = "SMMU and request list";
   if (!hostStopQueue (why)) return false;
-  smmuBypassStream (0x60, gHost.smmuMap, report, gHost.phys, kDmaBytes);
-  gHost.smmu = gHost.smmuMap->getVirtualAddress ();
-  uint32_t idr1 = read32 (gHost.smmu, 0x24);
-  gHost.cb = gHost.smmu + ((1U << (((idr1 >> 28) & 7) + 1)) + (report[0] >> 16)) * 4096;
-  if (gRootDiagnosticEnabled) {
+  hostPlatformPrepareDma (gHost.smmuMap, report, gHost.phys, kDmaBytes);
+  hostPlatformBindFaultRegisters (gHost.smmuMap, report, gHost.smmu, gHost.cb);
+  if (gRootDiagnosticEnabled && gHost.smmu) {
     gRootDiagnostic.gfsrBefore = read32 (gHost.smmu, 0x48);
     gRootDiagnostic.fsrBefore = read32 (gHost.cb, 0x58);
     gRootDiagnostic.smmuId2 = read32 (gHost.smmu, 0x28);
@@ -943,6 +794,12 @@ static bool hostBringUp (const char **why)
   if (hostNop () != kIOReturnSuccess) {
     gHost.ready = false;
     *why = "NOP OUT";
+    return false;
+  }
+  // A link this driver re-trained itself (native-ufs-probe=15) carries a device that still waits for
+  // fDeviceInit and sits in PWM-G1; the glue finishes that. Otherwise this is a no-op.
+  if (!hostPlatformAfterNop (why)) {
+    gHost.ready = false;
     return false;
   }
   uint32_t power = 0;
@@ -1306,12 +1163,13 @@ bool NativeUfsBlock::configure (const char *name, uint64_t absoluteOffset, uint6
 #endif
 }
 
-#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
-volatile uint64_t native_ufs_verified_blocks = 0;
 // Time spent hashing/verifying and reading from the UFS transport, in generic-timer ticks (diagnostic only).
 volatile uint64_t native_ufs_verify_ticks = 0, native_ufs_read_ticks = 0;
 static inline uint64_t timerTicks (void) {uint64_t v; __asm__ volatile ("isb\n\tmrs %0, cntpct_el0" : "=r" (v)); return v;}
+// Published counters of the owner-verified reads; they stay at zero in an unverified build.
+volatile uint64_t native_ufs_verified_blocks = 0;
 volatile uint32_t native_ufs_integrity_failures = 0;
+#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
 
 bool NativeUfsBlock::configureVerification ()
 {
@@ -1752,6 +1610,15 @@ bool NativeUfs::start (IOService *provider)
   }
   if (probe == 6) {
     dumpFirmwareList ();
+  }
+  if (probe == 15) {
+    // Re-train the link from the PHY up (ExynosUfsLink.h on Tensor; refused elsewhere), then run the
+    // read-only root check of probe 10 over the new link.
+    const char *why = "";
+    if (!hostPlatformLinkStartup (&why)) {
+      panic ("NATIVE_UFS link startup: %s", why);
+    }
+    probe = 10;
   }
   if ((probe >= 3 && probe <= 5) || probe == 9) {
     adoptAndRead (probe);
