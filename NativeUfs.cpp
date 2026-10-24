@@ -1180,6 +1180,10 @@ static inline uint64_t timerHz (void) {uint64_t v; __asm__ volatile ("mrs %0, cn
 // bytes/commands is the achieved transfer size; this transport runs one command at a time, polled and
 // serialised on the window lock, so per-command latency sets the ceiling on boot read throughput.
 volatile uint64_t native_ufs_diag_bytes = 0, native_ufs_diag_commands = 0, native_ufs_diag_reported = 0;
+// Time spent copying out of the bounce buffer into the caller's descriptor. The only step of the read
+// path that was never measured, and the measured transport and hash together account for barely a
+// quarter of the wall time the path consumes.
+volatile uint64_t native_ufs_copy_ticks = 0;
 static constexpr uint64_t kUfsDiagInterval = 32ull << 20;   // report every 32 MiB served
 // Published counters of the owner-verified reads; they stay at zero in an unverified build.
 volatile uint64_t native_ufs_verified_blocks = 0;
@@ -1367,7 +1371,9 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
       return kIOReturnSuccess;
     }
     uint64_t copy (uint64_t offset, const void *data, uint64_t length) {
+      uint64_t t0 = timerTicks ();
       uint64_t copied = buffer->writeBytes (offset, data, length);
+      __atomic_fetch_add (&native_ufs_copy_ticks, timerTicks () - t0, __ATOMIC_RELAXED);
       if (copied == length) __atomic_fetch_add (&native_ufs_block_reads, 1, __ATOMIC_RELAXED);
       return copied;
     }
@@ -1398,11 +1404,13 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
       uint64_t commands = __atomic_load_n (&native_ufs_diag_commands, __ATOMIC_RELAXED);
       uint64_t readTicks = __atomic_load_n (&native_ufs_read_ticks, __ATOMIC_RELAXED);
       uint64_t hashTicks = __atomic_load_n (&native_ufs_verify_ticks, __ATOMIC_RELAXED);
+      uint64_t copyTicks = __atomic_load_n (&native_ufs_copy_ticks, __ATOMIC_RELAXED);
       uint64_t readMs = (readTicks * 1000) / hz;
       IOLog ("NativeUfs: %llu MiB in %llu commands (%llu KiB each); transport %llu ms, hash %llu ms, "
-             "%llu us per command, %llu MiB/s while reading; wall %llu ms\n",
+             "copy %llu ms, %llu us per command, %llu MiB/s while reading; wall %llu ms\n",
              served >> 20, commands, commands ? (served / commands) >> 10 : 0, readMs,
-             (hashTicks * 1000) / hz, commands ? (readTicks * 1000000) / (hz * commands) : 0,
+             (hashTicks * 1000) / hz, (copyTicks * 1000) / hz,
+             commands ? (readTicks * 1000000) / (hz * commands) : 0,
              readMs ? (served >> 20) * 1000 / readMs : 0, (timerTicks () * 1000) / hz);
     }
   }
@@ -1629,7 +1637,13 @@ bool NativeUfs::start (IOService *provider)
   PE_parse_boot_argn ("native-ufs-probe", &probe, sizeof (probe));
   PE_parse_boot_argn ("native-ufs-root", &rootMode, sizeof (rootMode));
   native_ufs_probe_requested = probe != 0;
-  IOLog ("NativeUfs: start on %s: native-ufs-probe=%u native-ufs-root=%u\n", provider ? provider->getName () : "?", probe, rootMode);
+  // The wall figure shares its origin with the kernel log's own timestamps, so this line says how much
+  // of the time before the first disk read belongs to the firmware and the loader rather than to XNU.
+  {
+    uint64_t hz = timerHz ();
+    IOLog ("NativeUfs: start on %s: native-ufs-probe=%u native-ufs-root=%u, wall %llu ms\n",
+           provider ? provider->getName () : "?", probe, rootMode, hz ? (timerTicks () * 1000) / hz : 0);
+  }
   // Default: match for observability only, never touch the controller. Hardware work runs once,
   // from the root-device personality; the ufshc nub match stays observation-only.
   if ((!probe && !rootMode) || !OSDynamicCast (IOPlatformExpertDevice, provider)) {
