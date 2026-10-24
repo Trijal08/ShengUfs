@@ -75,8 +75,29 @@ static bool exynosGearChange (const char **why)
   return true;
 }
 
+// The link mode in force when the kernel takes the controller over. Mu-Silicium's UfsDxe trains to
+// HS gear 4 (S5P9875Pkg PlatformUfsLib BoardInit sets GearMode = 4), and this driver does not reset
+// the controller unless it re-trains the link itself, so that mode should survive the hand-off. A
+// link still in PWM-G1, the mode DME_LINKSTARTUP leaves behind, would cap reads near 1 MB/s.
+static void exynosReportInheritedLink (void)
+{
+  const char *ignored = NULL;
+  uint32_t pwrMode = 0, txGear = 0, rxGear = 0, txLanes = 0, rxLanes = 0, series = 0, maxGear = 0;
+
+  exynosDmeGet (0x1571, 0, &pwrMode, &ignored);   // PA_PwrMode: 0x11 fast both ways, 0x22 slow (PWM)
+  exynosDmeGet (0x1568, 0, &txGear, &ignored);    // PA_TxGear
+  exynosDmeGet (0x1583, 0, &rxGear, &ignored);    // PA_RxGear
+  exynosDmeGet (0x1560, 0, &txLanes, &ignored);   // PA_ActiveTxDataLanes
+  exynosDmeGet (0x1580, 0, &rxLanes, &ignored);   // PA_ActiveRxDataLanes
+  exynosDmeGet (0x156A, 0, &series, &ignored);    // PA_HSSeries
+  exynosDmeGet (0x1587, 0, &maxGear, &ignored);   // PA_MaxRxHSGear
+  IOLog ("NativeUfs: inherited link PA_PwrMode=%#x gear tx=%u rx=%u lanes tx=%u rx=%u HS series=%u max HS gear=%u\n",
+         pwrMode, txGear, rxGear, txLanes, rxLanes, series, maxGear);
+}
+
 static bool hostPlatformAfterNop (const char **why)
 {
+  exynosReportInheritedLink ();
   if (!gExynosLink.relinked) return true;
   if (!exynosEndBootMode (why) || !exynosRefClkSetup (why)) return false;
   return exynosGearChange (why);

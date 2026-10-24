@@ -1175,6 +1175,12 @@ bool NativeUfsBlock::configure (const char *name, uint64_t absoluteOffset, uint6
 // Time spent hashing/verifying and reading from the UFS transport, in generic-timer ticks (diagnostic only).
 volatile uint64_t native_ufs_verify_ticks = 0, native_ufs_read_ticks = 0;
 static inline uint64_t timerTicks (void) {uint64_t v; __asm__ volatile ("isb\n\tmrs %0, cntpct_el0" : "=r" (v)); return v;}
+static inline uint64_t timerHz (void) {uint64_t v; __asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (v)); return v;}
+// Diagnostic: bytes served and transport commands issued. One command per window iteration, so
+// bytes/commands is the achieved transfer size; this transport runs one command at a time, polled and
+// serialised on the window lock, so per-command latency sets the ceiling on boot read throughput.
+volatile uint64_t native_ufs_diag_bytes = 0, native_ufs_diag_commands = 0, native_ufs_diag_reported = 0;
+static constexpr uint64_t kUfsDiagInterval = 32ull << 20;   // report every 32 MiB served
 // Published counters of the owner-verified reads; they stay at zero in an unverified build.
 volatile uint64_t native_ufs_verified_blocks = 0;
 volatile uint32_t native_ufs_integrity_failures = 0;
@@ -1339,6 +1345,7 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
       uint64_t t0 = timerTicks ();
       IOReturn r = hostRead4k (0, lba, blocks, out);
       __atomic_fetch_add (&native_ufs_read_ticks, timerTicks () - t0, __ATOMIC_RELAXED);
+      __atomic_fetch_add (&native_ufs_diag_commands, 1, __ATOMIC_RELAXED);
       return r;
     }
     IOReturn verify (uint64_t index, const void *data, size_t length) {
@@ -1376,6 +1383,28 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
     __atomic_fetch_add (&native_ufs_block_failures, 1, __ATOMIC_RELAXED);
     gRootDiagnostic.result = static_cast<uint32_t> (result);
     rootDiagnosticFailure ("root window read failed");
+  }
+  //
+  // Diagnostic: where the boot's disk time actually goes. Printed every 32 MiB rather than per request,
+  // so one boot shows the achieved transfer size, the transport's share and the hash's share.
+  //
+  {
+    uint64_t served = __atomic_add_fetch (&native_ufs_diag_bytes, done, __ATOMIC_RELAXED);
+    uint64_t reported = __atomic_load_n (&native_ufs_diag_reported, __ATOMIC_RELAXED);
+    uint64_t hz = timerHz ();
+    if (hz && served - reported >= kUfsDiagInterval &&
+        __atomic_compare_exchange_n (&native_ufs_diag_reported, &reported, served, false,
+                                     __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+      uint64_t commands = __atomic_load_n (&native_ufs_diag_commands, __ATOMIC_RELAXED);
+      uint64_t readTicks = __atomic_load_n (&native_ufs_read_ticks, __ATOMIC_RELAXED);
+      uint64_t hashTicks = __atomic_load_n (&native_ufs_verify_ticks, __ATOMIC_RELAXED);
+      uint64_t readMs = (readTicks * 1000) / hz;
+      IOLog ("NativeUfs: %llu MiB in %llu commands (%llu KiB each); transport %llu ms, hash %llu ms, "
+             "%llu us per command, %llu MiB/s while reading; wall %llu ms\n",
+             served >> 20, commands, commands ? (served / commands) >> 10 : 0, readMs,
+             (hashTicks * 1000) / hz, commands ? (readTicks * 1000000) / (hz * commands) : 0,
+             readMs ? (served >> 20) * 1000 / readMs : 0, (timerTicks () * 1000) / hz);
+    }
   }
   completion->action (completion->target, completion->parameter, result, done);
   return kIOReturnSuccess;
