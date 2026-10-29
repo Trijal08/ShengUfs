@@ -11,10 +11,13 @@
 #include <vm/vm_kern_xnu.h>
 #endif
 #include <vm/vm_map.h>
-#if __has_include(<vm/vm_map_internal.h>)
-/* vm_map_protect moved the same way. */
-#include <vm/vm_map_internal.h>
-#endif
+/* vm_map_protect is MACH_KERNEL_PRIVATE in xnu-12377, which a driver translation unit does not
+   get. vm_protect changes the protection of the same map, taking a length where vm_map_protect
+   takes an end address and its two last arguments the other way round. */
+static inline kern_return_t native_protect_read_only (vm_map_t map, vm_offset_t address, vm_size_t size)
+{
+  return vm_protect (map, address, size, TRUE, VM_PROT_READ);
+}
 #include <sys/param.h>
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
 #include "verified_root.h"
@@ -1251,8 +1254,7 @@ bool NativeUfsBlock::configureVerification ()
   uint8_t *key = reinterpret_cast<uint8_t *> (verifiedStorage + tableBytes);
   memcpy (key, verified_root_key, VR_KEY_BYTES);
   gRootDiagnostic.stage = "policy read-only protection";
-  if (vm_map_protect (kernel_map, verifiedStorage, verifiedStorage + verifiedStorageBytes,
-                      VM_PROT_READ, TRUE) != KERN_SUCCESS) {
+  if (native_protect_read_only (kernel_map, verifiedStorage, verifiedStorageBytes) != KERN_SUCCESS) {
     return false;
   }
   gRootDiagnostic.stage = "owner signature and hash table";
