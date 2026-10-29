@@ -6,7 +6,15 @@
 #include <IOKit/storage/IOBlockStorageDevice.h>
 #include <libkern/crypto/sha2.h>
 #include <vm/vm_kern.h>
+#if __has_include(<vm/vm_kern_xnu.h>)
+/* kmem_alloc and the KMA_* flags left the installed vm_kern.h for this XNU-private header. */
+#include <vm/vm_kern_xnu.h>
+#endif
 #include <vm/vm_map.h>
+#if __has_include(<vm/vm_map_internal.h>)
+/* vm_map_protect moved the same way. */
+#include <vm/vm_map_internal.h>
+#endif
 #include <sys/param.h>
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
 #include "verified_root.h"
